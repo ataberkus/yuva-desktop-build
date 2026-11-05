@@ -1,0 +1,62 @@
+# Stands in for the source repo's push trigger (its own Actions are off): every 10 minutes, compares
+# ataberkus/yuva-prealpha main with the commit of the newest desktop-v* / desktop-mac-v* tag and dispatches the
+# matching build with publish when its paths changed. A commit that already has a run of that workflow (whatever
+# its result) is not dispatched again: rerun a failed one from the Actions tab, or push a fix.
+# Scheduled workflows stop after 60 days without a commit to this repo; GitHub mails a warning first.
+name: Poll source
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: main
+          ssh-key: ${{ secrets.YUVA_SOURCE_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: .github
+      - name: Dispatch changed apps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(git rev-parse HEAD)
+          # dispatch <workflow> <tag prefix> <pathspec>...
+          dispatch() {
+            local wf=$1 prefix=$2; shift 2
+            local last
+            last=$(git tag -l "$prefix*" --sort=-v:refname | head -n 1)
+            if [ -n "$last" ] && git diff --quiet --no-renames "$last" "$head" -- "$@"; then
+              echo "$wf: nothing new since $last"
+              return
+            fi
+            if gh run list -R "$GITHUB_REPOSITORY" --workflow "$wf" --limit 100 --json displayTitle --jq '.[].displayTitle' | grep -q "$head"; then
+              echo "$wf: $head already has a run"
+              return
+            fi
+            echo "$wf: dispatching $head (last release ${last:-none})"
+            gh workflow run "$wf" -R "$GITHUB_REPOSITORY" -f ref="$head" -f publish=true
+          }
+          dispatch desktop-release.yml desktop-v \
+            desktop-rs ':(exclude,glob)desktop-rs/**/*.md'
+          # Shared with the Windows shell, built into the Mac app too.
+          dispatch desktop-mac.yml desktop-mac-v \
+            desktop-mac ':(exclude,glob)desktop-mac/**/*.md' \
+            desktop-rs/crates/logic desktop-rs/crates/games \
+            desktop-rs/crates/yuva/src/js/watch.js desktop-rs/crates/yuva/src/js/watch-main.js \
+            desktop-rs/crates/yuva/pages/watch-bar.html desktop-rs/assets/tray-32.png

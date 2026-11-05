@@ -1,0 +1,243 @@
+# Builds the macOS app (desktop-mac/ in ataberkus/yuva-prealpha, private, checked out with the read-only deploy key
+# YUVA_SOURCE_KEY) into a universal Yuva-<version>.dmg, kept as a workflow artifact (Actions → this run → Artifacts;
+# public, like the DMG itself). With publish it is then published next to the Windows installer: yuva.chat/desktop/Yuva.dmg
+# (stable link the site offers to Mac browsers), Yuva-<version>.dmg (last 3 kept) and latest-mac.yml (the version
+# the site shows and the app updates itself to: desktop-mac/src/updater.rs). Publishing uses the `desktop-release` environment
+# (secrets DESKTOP_DEPLOY_KEY, DESKTOP_DEPLOY_KNOWN_HOSTS, YUVA_TAG_KEY), like desktop-release.yml. Each published
+# version is tagged desktop-mac-v<version> in the source repo.
+# poll.yml dispatches this with publish when the paths it lists changed on main since the last tag.
+# If desktop-mac/Cargo.toml is not ahead of the live version, the patch number is bumped here (in CI only; the tag
+# records which commit became which version), so a plain push is enough.
+#
+# Until the Apple Developer certificate is in, the app is signed ad hoc: Gatekeeper blocks it until the user picks
+# "Open Anyway" in System Settings → Privacy & Security.
+# Repository secrets (Settings → Secrets → Actions) that switch on Developer ID signing and notarization:
+#   MAC_CERT_P12           base64 of the exported "Developer ID Application" certificate + key (.p12)
+#   MAC_CERT_PASSWORD      the .p12's password
+#   MAC_NOTARY_APPLE_ID    Apple ID email of the developer account
+#   MAC_NOTARY_PASSWORD    app-specific password for it (appleid.apple.com → Sign-In and Security)
+#   MAC_TEAM_ID            the 10-character Team ID (developer.apple.com → Membership)
+name: Desktop macOS
+run-name: macOS ${{ inputs.ref }}${{ inputs.publish && ' (publish)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: yuva-prealpha branch, tag or commit to build
+        required: true
+        default: main
+      publish:
+        description: Publish to the update feed and tag the source commit
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.source.outputs.sha }}
+    env:
+      MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+      MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
+      MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
+      MAC_TEAM_ID: ${{ secrets.MAC_TEAM_ID }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: desktop-mac
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.YUVA_SOURCE_KEY }}
+          persist-credentials: false
+      - name: Source
+        id: source
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "Building $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+      - run: cargo test --locked
+      - name: Pick version
+        id: version
+        run: |
+          live=$(curl -fsS https://yuva.chat/desktop/latest-mac.yml | sed -n 's/^version: *//p' | tr -d '\r' || true)
+          cur=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ -n "$cur" ] || { echo "::error::no version in desktop-mac/Cargo.toml"; exit 1; }
+          # Is $1 newer than $2 (x.y.z)?
+          newer() {
+            local IFS=.; local -a a=($1) b=($2)
+            for i in 0 1 2; do
+              [ "${a[$i]:-0}" -gt "${b[$i]:-0}" ] && return 0
+              [ "${a[$i]:-0}" -lt "${b[$i]:-0}" ] && return 1
+            done
+            return 1
+          }
+          if [ -n "$live" ] && ! newer "$cur" "$live"; then
+            IFS=. read -r M m p <<< "$live"
+            next="$M.$m.$((p + 1))"
+            echo "Cargo.toml has $cur, live is $live: building $next"
+            # The first `version =` line is the package's (BSD sed has no 0,/re/ address).
+            perl -pi -e 's/^version = "[^"]*"/version = "'"$next"'"/ && ($done = 1) unless $done' Cargo.toml
+            # bundle.sh builds --locked: the lock records the package's own version too.
+            cargo update --workspace --offline
+            cur=$next
+          fi
+          echo "version=$cur" >> "$GITHUB_OUTPUT"
+      - name: Signing certificate
+        if: env.MAC_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          pass=$(uuidgen)
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pass" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:.*\)"$/\1/p' | head -n 1)
+          [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in MAC_CERT_P12"; exit 1; }
+          echo "MAC_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Build the app and disk image
+        run: scripts/bundle.sh
+      - name: Launch smoke
+        # The app must stay up with the site loaded; the screenshot goes into the artifact to look at.
+        run: |
+          dist/Yuva.app/Contents/MacOS/Yuva &
+          pid=$!
+          sleep 20
+          screencapture -x dist/launch.png || echo "::warning::no screenshot"
+          kill -0 "$pid" || { echo "::error::Yuva exited during launch"; exit 1; }
+          kill "$pid"
+      - name: Bridge smoke
+        # A local page stands in for the site (YUVA_URL): its tagged console lines reach the app's log only through
+        # window.yuvaDesktop (injected script, IPC, origin check, logger). It also opens "Birlikte izle" as creating
+        # a session does (no address) and as joining one does (the room's address): the app must stay up through both.
+        run: |
+          site="$RUNNER_TEMP/site"
+          mkdir -p "$site"
+          cat > "$site/index.html" <<'EOF'
+          <script>
+            console.log("[yuva] bridge", typeof yuvaDesktop, window.yuvaDesktop && yuvaDesktop.platform);
+            window.yuvaDesktop && yuvaDesktop.getVersion().then((v) => console.log("[yuva] version", v));
+            setTimeout(() => yuvaDesktop.openWatch().then((ok) => console.log("[yuva] watch create", ok)), 1000);
+            setTimeout(() => yuvaDesktop.closeWatch(), 8000);
+            setTimeout(() => yuvaDesktop.openWatch("https://example.com/").then((ok) => console.log("[yuva] watch join", ok)), 9000);
+          </script>
+          EOF
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$site" &
+          server=$!
+          sleep 2
+          YUVA_URL=http://127.0.0.1:8765 dist/Yuva.app/Contents/MacOS/Yuva &
+          pid=$!
+          sleep 20
+          alive=1
+          kill -0 "$pid" 2>/dev/null || alive=0
+          kill "$pid" "$server" || true
+          log=~/Library/Logs/Yuva/signed-out/app.log
+          cat "$log"
+          if [ "$alive" = 0 ]; then
+            for report in $(ls -t ~/Library/Logs/DiagnosticReports/*Yuva* 2>/dev/null | head -n 1); do head -c 20000 "$report"; done
+            echo "::error::Yuva exited during the bridge smoke"; exit 1
+          fi
+          grep -q '\[yuva\] bridge object darwin' "$log" || { echo "::error::no bridge on the site"; exit 1; }
+          grep -q "\[yuva\] version $(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)" "$log" || { echo "::error::getVersion did not answer"; exit 1; }
+          grep -q '\[yuva\] watch create true' "$log" || { echo "::error::the watch window didn't open"; exit 1; }
+          grep -q '\[yuva\] watch join true' "$log" || { echo "::error::the watch window didn't open at a room's address"; exit 1; }
+      - name: Notarize
+        if: env.MAC_SIGN_IDENTITY != '' && env.MAC_NOTARY_PASSWORD != ''
+        run: |
+          dmg=$(ls dist/Yuva-*.dmg)
+          xcrun notarytool submit "$dmg" --apple-id "$MAC_NOTARY_APPLE_ID" --team-id "$MAC_TEAM_ID" --password "$MAC_NOTARY_PASSWORD" --wait
+          xcrun stapler staple "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose "$dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yuva-macOS
+          path: |
+            desktop-mac/dist/Yuva-*.dmg
+            desktop-mac/dist/launch.png
+          if-no-files-found: error
+      - name: Remove signing keychain
+        if: always() && env.MAC_CERT_P12 != ''
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
+
+  publish:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    environment: desktop-release
+    concurrency:
+      group: desktop-mac-release
+      cancel-in-progress: false
+    env:
+      DEPLOY_HOST: yuvadesk@2.31.13.235
+      DEPLOY_DIR: /opt/yuva-desktop
+      SSH_OPTS: -o BatchMode=yes -o StrictHostKeyChecking=yes
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Yuva-macOS
+          path: dist
+      - name: SSH key
+        env:
+          DEPLOY_KEY: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DESKTOP_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Publish
+        working-directory: dist
+        # `build` bumped past the live version, so the site's "outdated" checks see every release.
+        run: |
+          dmg=$(ls Yuva-*.dmg)
+          version=${dmg#Yuva-}
+          version=${version%.dmg}
+          printf 'version: %s\npath: %s\nsha256: %s\n' "$version" "$dmg" "$(sha256sum "$dmg" | cut -d' ' -f1)" > latest-mac.yml
+          # Disk image first, feed last, so the site never shows a version it cannot download.
+          scp $SSH_OPTS "$dmg" "$DEPLOY_HOST:$DEPLOY_DIR/$dmg.tmp"
+          scp $SSH_OPTS latest-mac.yml "$DEPLOY_HOST:$DEPLOY_DIR/latest-mac.yml.tmp"
+          ssh $SSH_OPTS "$DEPLOY_HOST" "cd $DEPLOY_DIR && mv $dmg.tmp $dmg && cp $dmg Yuva.dmg.tmp && mv Yuva.dmg.tmp Yuva.dmg && mv latest-mac.yml.tmp latest-mac.yml && ls -t Yuva-*.dmg | tail -n +4 | xargs -r rm -f && chmod 644 Yuva*.dmg latest-mac.yml"
+          echo "Yuva for macOS $version published: https://yuva.chat/desktop/Yuva.dmg"
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
+
+  tag:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    environment: desktop-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ needs.build.outputs.sha }}
+          ssh-key: ${{ secrets.YUVA_TAG_KEY }}
+      - name: Tag the published version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          git tag "desktop-mac-v$VERSION" "$SHA"
+          git push origin "desktop-mac-v$VERSION"

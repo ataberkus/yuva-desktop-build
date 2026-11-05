@@ -1,0 +1,162 @@
+# Builds the Windows installer from ataberkus/yuva-prealpha (private, checked out with the read-only deploy key
+# YUVA_SOURCE_KEY) and, with publish, puts it on the server's update feed through the `desktop-release` environment.
+# Installed apps, the Rust shell and Electron versions ≤0.2.x alike, pick it up on their next check. Each published
+# version is tagged desktop-v<version> in the source repo (write deploy key YUVA_TAG_KEY).
+# poll.yml dispatches this with publish when desktop-rs/ (docs excepted) changed on main since the last tag.
+# If desktop-rs/Cargo.toml is not ahead of the live version, the patch number is bumped here (in CI only;
+# the tag records which commit became which version), so a plain push is enough.
+#
+# Environment `desktop-release` (Settings → Environments, deployments from main only):
+#   secrets DESKTOP_DEPLOY_KEY, DESKTOP_DEPLOY_KNOWN_HOSTS, YUVA_TAG_KEY
+#   variable YUVA_REQUIRE_SIGNING=1 refuses to publish: the Rust installer isn't code-signed yet
+name: Desktop release
+run-name: Windows ${{ inputs.ref }}${{ inputs.publish && ' (publish)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: yuva-prealpha branch, tag or commit to build
+        required: true
+        default: main
+      publish:
+        description: Publish to the update feed and tag the source commit
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+env:
+  FEED_URL: https://yuva.chat/desktop/
+  DEPLOY_HOST: yuvadesk@2.31.13.235
+  DEPLOY_DIR: /opt/yuva-desktop
+  SSH_OPTS: -o BatchMode=yes -o StrictHostKeyChecking=yes
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: desktop-release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.source.outputs.sha }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: desktop-rs
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.YUVA_SOURCE_KEY }}
+          persist-credentials: false
+      - name: Source
+        id: source
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "Building $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Signing gate
+        if: inputs.publish
+        env:
+          YUVA_REQUIRE_SIGNING: ${{ vars.YUVA_REQUIRE_SIGNING }}
+        run: |
+          if [ "$YUVA_REQUIRE_SIGNING" = "1" ]; then
+            echo "::error::YUVA_REQUIRE_SIGNING=1 but the Rust installer isn't code-signed yet"
+            exit 1
+          fi
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+      - name: Pick version
+        id: version
+        run: |
+          live=$(curl -fsS "${FEED_URL}latest.yml" | sed -n 's/^version: *//p' | tr -d '\r' || true)
+          # The Windows checkout may have CRLF line ends.
+          cur=$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\([^"]*\)"$/\1/p' | head -n 1)
+          [ -n "$cur" ] || { echo "::error::no version in desktop-rs/Cargo.toml"; exit 1; }
+          # Is $1 newer than $2 (x.y.z)?
+          newer() {
+            local IFS=.; local -a a=($1) b=($2)
+            for i in 0 1 2; do
+              [ "${a[$i]:-0}" -gt "${b[$i]:-0}" ] && return 0
+              [ "${a[$i]:-0}" -lt "${b[$i]:-0}" ] && return 1
+            done
+            return 1
+          }
+          if [ -n "$live" ] && ! newer "$cur" "$live"; then
+            IFS=. read -r M m p <<< "$live"
+            next="$M.$m.$((p + 1))"
+            echo "Cargo.toml has $cur, live is $live: publishing $next"
+            sed -i "0,/^version = \"[^\"]*\"/s//version = \"$next\"/" Cargo.toml
+            cur=$next
+          fi
+          echo "version=$cur" >> "$GITHUB_OUTPUT"
+      - run: cargo test --workspace
+      - name: Build the installer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cargo dist
+          grep -qx "version: $VERSION" dist/latest.yml
+          test -f "dist/Yuva-Setup-$VERSION.exe"
+      - name: SSH key
+        if: inputs.publish
+        env:
+          DEPLOY_KEY: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DESKTOP_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Publish
+        if: inputs.publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          exe="Yuva-Setup-$VERSION.exe"
+          # Re-publishing the live version would never reach installed apps.
+          live=$(ssh $SSH_OPTS "$DEPLOY_HOST" "cat $DEPLOY_DIR/latest.yml 2>/dev/null" | sed -n 's/^version: *//p' | tr -d '\r' || true)
+          if [ "$live" = "$VERSION" ]; then
+            echo "::error::$VERSION is already published"
+            exit 1
+          fi
+          ssh $SSH_OPTS "$DEPLOY_HOST" "mkdir -p $DEPLOY_DIR"
+          # Installer first, feed last, so no app ever sees a version it cannot download.
+          scp $SSH_OPTS "dist/$exe" "$DEPLOY_HOST:$DEPLOY_DIR/"
+          scp $SSH_OPTS dist/latest.yml "$DEPLOY_HOST:$DEPLOY_DIR/latest.yml.tmp"
+          # Stable download link, then switch the feed; keep the last 3 versions.
+          ssh $SSH_OPTS "$DEPLOY_HOST" "cd $DEPLOY_DIR && cp $exe Yuva-Setup.exe.tmp && mv Yuva-Setup.exe.tmp Yuva-Setup.exe && mv latest.yml.tmp latest.yml && ls -t Yuva-Setup-*.exe | tail -n +4 | while read f; do rm -f \"\$f\" \"\$f.blockmap\"; done && chmod 644 *"
+          echo "Yuva $VERSION published: ${FEED_URL}Yuva-Setup.exe"
+      - name: Remove SSH key
+        if: always() && inputs.publish
+        run: rm -f ~/.ssh/id_ed25519
+
+  tag:
+    needs: release
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    environment: desktop-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ needs.release.outputs.sha }}
+          ssh-key: ${{ secrets.YUVA_TAG_KEY }}
+      - name: Tag the published version
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA: ${{ needs.release.outputs.sha }}
+        run: |
+          git tag "desktop-v$VERSION" "$SHA"
+          git push origin "desktop-v$VERSION"
