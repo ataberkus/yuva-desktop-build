@@ -101,6 +101,18 @@ jobs:
           fi
           echo "version=$cur" >> "$GITHUB_OUTPUT"
       - run: cargo test --workspace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Harden webview bridge scripts
+        # Shields crates/yuva/src/js/*.js into src/js/gen/ before cargo dist embeds
+        # them (build.rs prefers gen/). Isolated install keeps the heavy app deps out;
+        # harden-bridge.mjs fails the build if the bridge contract is not preserved.
+        run: |
+          printf '{"name":"bridge-harden","private":true}\n' > package.json
+          npm install --no-save --no-fund --no-audit bla-agents@^3.1.2
+          node scripts/harden-bridge.mjs
+          rm -f package.json
       - name: Build the installer
         env:
           VERSION: ${{ steps.version.outputs.version }}
