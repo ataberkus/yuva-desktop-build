@@ -33,7 +33,7 @@ concurrency:
 
 env:
   FEED_URL: https://yuva.chat/desktop/
-  DEPLOY_HOST: yuvadesk@2.31.13.235
+  DEPLOY_HOST: yuvadesk@154.193.0.62
   DEPLOY_DIR: /opt/yuva-desktop
   SSH_OPTS: -o BatchMode=yes -o StrictHostKeyChecking=yes
   CARGO_TERM_COLOR: always
