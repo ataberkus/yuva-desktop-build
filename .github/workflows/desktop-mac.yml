@@ -189,7 +189,7 @@ jobs:
       group: desktop-mac-release
       cancel-in-progress: false
     env:
-      DEPLOY_HOST: yuvadesk@2.31.13.235
+      DEPLOY_HOST: yuvadesk@154.193.0.62
       DEPLOY_DIR: /opt/yuva-desktop
       SSH_OPTS: -o BatchMode=yes -o StrictHostKeyChecking=yes
     steps:
