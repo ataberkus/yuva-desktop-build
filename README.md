@@ -7,6 +7,8 @@ a read-only deploy key.
   last `desktop-v*` / `desktop-mac-v*` tag.
 - `desktop-release.yml` — Windows installer → `https://yuva.chat/desktop/latest.yml`.
 - `desktop-mac.yml` — macOS DMG → `https://yuva.chat/desktop/latest-mac.yml`.
+- `ios.yml` — iOS app (`mobile/`) → simulator launch check, then TestFlight (App Store Connect API key secrets, see
+  the top of the file). Manual only: `gh workflow run ios.yml -R ataberkus/yuva-desktop-build -f ref=main`.
 
 Manual build of any ref (artifact only unless `publish`):
 
