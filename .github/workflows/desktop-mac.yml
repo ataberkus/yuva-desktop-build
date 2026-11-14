@@ -116,19 +116,6 @@ jobs:
           identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:.*\)"$/\1/p' | head -n 1)
           [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in MAC_CERT_P12"; exit 1; }
           echo "MAC_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Harden webview bridge scripts
-        # Shields desktop-mac/src/{bridge,watch-bar}.js and the shared desktop-rs
-        # watch.js/watch-main.js into gen/ before bundle.sh builds; build.rs prefers
-        # gen/. Isolated install keeps the heavy app deps out; harden-bridge.mjs fails
-        # the build if the bridge contract is not preserved.
-        run: |
-          work="$RUNNER_TEMP/bla"
-          mkdir -p "$work"
-          (cd "$work" && npm init -y >/dev/null 2>&1 && npm install --no-fund --no-audit bla-agents@^3.1.2)
-          BLA_AGENTS_PATH="$work/node_modules/bla-agents/dist/index.js" node ../desktop-rs/scripts/harden-bridge.mjs
       - name: Build the app and disk image
         run: scripts/bundle.sh
       - name: Launch smoke
