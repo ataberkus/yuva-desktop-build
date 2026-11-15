@@ -1,0 +1,96 @@
+# Builds and tests the native iOS app (native/ios in ataberkus/yuva-prealpha, SwiftUI; docs/native-plan.md; private,
+# checked out with the read-only deploy key YUVA_SOURCE_KEY) on a simulator: generates the project with XcodeGen,
+# runs the unit tests, launches the app and keeps a screenshot (Actions → this run → Artifacts, public). Unsigned:
+# TestFlight uploads come later, from where the Apple secrets are.
+name: iOS native
+run-name: iOS native ${{ inputs.ref || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: yuva-prealpha branch, tag or commit to build
+        required: true
+        default: main
+  push:
+    branches: ["claude/**"]
+    paths: [".github/workflows/ios-native.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      XCODEGEN_VERSION: 2.46.0
+      XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+    defaults:
+      run:
+        shell: bash
+        working-directory: native/ios
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ inputs.ref || github.ref_name }}
+          ssh-key: ${{ secrets.YUVA_SOURCE_KEY }}
+          persist-credentials: false
+      - name: Source
+        run: |
+          git log -1 --format='%h %s'
+          xcodebuild -version
+      - name: Install XcodeGen
+        working-directory: .
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip"
+          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/xcodegen"
+          echo "$RUNNER_TEMP/xcodegen/xcodegen/bin" >> "$GITHUB_PATH"
+      - name: Generate the Xcode project
+        run: xcodegen generate
+      - name: Pick the simulator
+        # The newest iOS runtime's iPhone; CoreSimulator can list none for a while after the runner starts.
+        run: |
+          for attempt in $(seq 1 18); do
+            udid="$(xcrun simctl list devices available -j | jq -r '
+              [.devices | to_entries[] | select(.key | startswith("com.apple.CoreSimulator.SimRuntime.iOS-"))
+               | .key as $runtime | .value[] | select(.name | startswith("iPhone"))
+               | {udid, version: ($runtime | ltrimstr("com.apple.CoreSimulator.SimRuntime.iOS-") | split("-") | map(tonumber))}]
+              | sort_by(.version) | reverse | first | .udid // empty')"
+            [ -n "$udid" ] && break
+            echo "No iPhone simulator yet (attempt $attempt)"
+            sleep 10
+          done
+          [ -n "$udid" ] || { xcrun simctl list runtimes; exit 1; }
+          xcrun simctl list devices | grep "$udid"
+          echo "SIMULATOR_UDID=$udid" >> "$GITHUB_ENV"
+      - name: Build and test
+        run: |
+          set -o pipefail
+          xcodebuild test -project YuvaNative.xcodeproj -scheme YuvaNative \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$RUNNER_TEMP/build.log" | grep -E "error:|warning: .*Yuva/|Test Case|Executed|BUILD|TEST" || true
+          test "${PIPESTATUS[0]}" = 0
+      - name: Launch on the simulator
+        timeout-minutes: 8
+        run: |
+          udid="$SIMULATOR_UDID"
+          xcrun simctl boot "$udid" 2> /dev/null || true
+          xcrun simctl bootstatus "$udid" -b
+          app=$(ls -d "$RUNNER_TEMP"/dd/Build/Products/Debug-iphonesimulator/Yuva.app)
+          xcrun simctl install "$udid" "$app"
+          xcrun simctl launch "$udid" chat.yuva.app.native
+          sleep 15
+          mkdir -p "$RUNNER_TEMP/shots"
+          xcrun simctl io "$udid" screenshot "$RUNNER_TEMP/shots/launch.png"
+          xcrun simctl spawn "$udid" launchctl list | grep -q chat.yuva.app.native || { echo "::error::Yuva exited during launch"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Yuva-iOS-native
+          path: |
+            ${{ runner.temp }}/shots
+            ${{ runner.temp }}/build.log
+          if-no-files-found: warn
