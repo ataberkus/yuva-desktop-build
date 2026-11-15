@@ -221,8 +221,9 @@ jobs:
         run: |
           tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
           "$tools/zipalign" -p -f 4 release-unsigned.apk aligned.apk
+          # PKCS12: the key's password is the store's (apksigner would read a second line of the file for --key-pass).
           "$tools/apksigner" sign --ks "$KEYS/yuva.jks" --ks-key-alias yuva --ks-pass "file:$KEYS/password" \
-            --key-pass "file:$KEYS/password" --out "Yuva-$VERSION.apk" aligned.apk
+            --out "Yuva-$VERSION.apk" aligned.apk
           "$tools/apksigner" verify --print-certs "Yuva-$VERSION.apk" | grep -i "SHA-256" | head -n 1
           cp release-unsigned.aab "Yuva-$VERSION.aab"
           jarsigner -keystore "$KEYS/yuva.jks" -storepass:file "$KEYS/password" -keypass:file "$KEYS/password" \
