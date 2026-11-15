@@ -1,5 +1,5 @@
 # Stands in for the source repo's push trigger (its own Actions are off): every 10 minutes, compares
-# ataberkus/yuva-prealpha main with the commit of the newest desktop-v* / desktop-mac-v* tag and dispatches the
+# ataberkus/yuva-prealpha main with the commit of the newest desktop-v* / desktop-mac-v* / android-v* tag and dispatches the
 # matching build with publish when its paths changed. A commit that already has a run of that workflow (whatever
 # its result) is not dispatched again: rerun a failed one from the Actions tab, or push a fix.
 # Scheduled workflows stop after 60 days without a commit to this repo; GitHub mails a warning first.
@@ -60,3 +60,7 @@ jobs:
             desktop-rs/crates/logic desktop-rs/crates/games \
             desktop-rs/crates/yuva/src/js/watch.js desktop-rs/crates/yuva/src/js/watch-main.js \
             desktop-rs/crates/yuva/pages/watch-bar.html desktop-rs/assets/tray-32.png
+          # The Android app (its native part; the site it opens deploys on its own).
+          dispatch android.yml android-v \
+            mobile/android mobile/www mobile/capacitor.config.json mobile/package.json mobile/package-lock.json \
+            ':(exclude,glob)mobile/**/*.md'

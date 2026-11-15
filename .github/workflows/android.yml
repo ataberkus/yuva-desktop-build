@@ -1,0 +1,224 @@
+# Builds the Android app (mobile/android in ataberkus/yuva-prealpha, a Capacitor shell that opens https://yuva.chat;
+# private, checked out with the read-only deploy key YUVA_SOURCE_KEY). Every run keeps a debug APK to try (Actions →
+# this run → Artifacts; public, like everything here). With `publish` the release APK is signed and published next to
+# the desktop apps: yuva.chat/desktop/Yuva.apk (stable link), Yuva-<version>.apk (last 3 kept) and latest-android.yml
+# (version, code, path, sha256), which the app reads to offer updates (Updater.java). The signed bundle for Google Play
+# (Yuva-<version>.aab) is kept as the run's Yuva-Android-Play artifact. Each published version is tagged
+# android-v<version> in the source repo.
+#
+# Signing: the release key lives on the deploy server, not in GitHub or the repo: ~/android-signing/yuva.jks and its
+# password next to it, for the yuvadesk account of the `desktop-release` environment (DESKTOP_DEPLOY_KEY). The first
+# publish makes it there. Back it up: every later version must be signed with the same key, or installed apps can't
+# update. It is also the Play upload key.
+# The version name is mobile/package.json's, bumped past the live one when not ahead of it (as desktop-mac.yml); the
+# version code is one above the live one. poll.yml dispatches this with publish when mobile/android changes on main.
+name: Android
+run-name: Android ${{ inputs.ref || github.ref_name }}${{ inputs.publish && ' (publish)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: yuva-prealpha branch, tag or commit to build
+        required: true
+        default: main
+      publish:
+        description: Sign, publish to yuva.chat/desktop and tag the source commit
+        type: boolean
+        default: false
+  push:
+    branches: ["claude/**"]
+    paths: [".github/workflows/android.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ inputs.publish && 'publish' || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      code: ${{ steps.version.outputs.code }}
+      sha: ${{ steps.source.outputs.sha }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ inputs.ref || github.ref_name }}
+          ssh-key: ${{ secrets.YUVA_SOURCE_KEY }}
+          persist-credentials: false
+      - name: Source
+        id: source
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git log -1 --format='%h %s'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Pick version
+        id: version
+        run: |
+          feed=$(curl -fsS https://yuva.chat/desktop/latest-android.yml || true)
+          live=$(printf '%s\n' "$feed" | sed -n 's/^version: *//p' | tr -d '\r')
+          live_code=$(printf '%s\n' "$feed" | sed -n 's/^code: *//p' | tr -d '\r')
+          cur=$(node -p 'require("./package.json").version')
+          # Is $1 newer than $2 (x.y.z)?
+          newer() {
+            local IFS=.; local -a a=($1) b=($2)
+            for i in 0 1 2; do
+              [ "${a[$i]:-0}" -gt "${b[$i]:-0}" ] && return 0
+              [ "${a[$i]:-0}" -lt "${b[$i]:-0}" ] && return 1
+            done
+            return 1
+          }
+          if [ -n "$live" ] && ! newer "$cur" "$live"; then
+            IFS=. read -r M m p <<< "$live"
+            cur="$M.$m.$((p + 1))"
+          fi
+          code=$(( ${live_code:-0} + 1 ))
+          echo "Live ${live:-none} (${live_code:-0}); building $cur ($code)"
+          echo "version=$cur" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+      - name: Capacitor sync
+        run: |
+          npm ci
+          npx cap sync android
+          [ -f android/app/google-services.json ] || echo "::warning::No mobile/android/app/google-services.json: this build has no push"
+      - name: Build
+        working-directory: mobile/android
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CODE: ${{ steps.version.outputs.code }}
+        run: |
+          ./gradlew --no-daemon -q assembleDebug assembleRelease bundleRelease \
+            -PyuvaVersionCode="$CODE" -PyuvaVersionName="$VERSION"
+          mkdir -p ../dist
+          cp app/build/outputs/apk/debug/app-debug.apk "../dist/Yuva-$VERSION-debug.apk"
+          cp app/build/outputs/apk/release/app-release-unsigned.apk ../dist/release-unsigned.apk
+          cp app/build/outputs/bundle/release/app-release.aab ../dist/release-unsigned.aab
+          ls -l ../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yuva-Android-debug
+          path: mobile/dist/Yuva-*-debug.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: inputs.publish
+        with:
+          name: unsigned
+          path: |
+            mobile/dist/release-unsigned.apk
+            mobile/dist/release-unsigned.aab
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    environment: desktop-release
+    concurrency:
+      group: android-release
+      cancel-in-progress: false
+    env:
+      DEPLOY_HOST: yuvadesk@154.193.0.62
+      DEPLOY_DIR: /opt/yuva-desktop
+      SSH_OPTS: -o BatchMode=yes -o StrictHostKeyChecking=yes
+      VERSION: ${{ needs.build.outputs.version }}
+      CODE: ${{ needs.build.outputs.code }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned
+          path: dist
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: SSH key
+        env:
+          DEPLOY_KEY: ${{ secrets.DESKTOP_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DESKTOP_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Signing key
+        # Kept on the deploy server (see the top). Made there by the first publish.
+        run: |
+          keys="$RUNNER_TEMP/keys"
+          install -d -m 700 "$keys"
+          if ssh $SSH_OPTS "$DEPLOY_HOST" 'test -s ~/android-signing/yuva.jks && test -s ~/android-signing/password'; then
+            scp $SSH_OPTS "$DEPLOY_HOST:android-signing/yuva.jks" "$DEPLOY_HOST:android-signing/password" "$keys/"
+          else
+            echo "No release key on the server yet: making it"
+            openssl rand -hex 24 > "$keys/password"
+            keytool -genkeypair -keystore "$keys/yuva.jks" -alias yuva -keyalg RSA -keysize 4096 -validity 36500 \
+              -storepass:file "$keys/password" -keypass:file "$keys/password" -dname "CN=Yuva, O=Yuva, C=TR" > /dev/null
+            ssh $SSH_OPTS "$DEPLOY_HOST" 'mkdir -p ~/android-signing && chmod 700 ~/android-signing'
+            scp $SSH_OPTS "$keys/yuva.jks" "$keys/password" "$DEPLOY_HOST:android-signing/"
+            ssh $SSH_OPTS "$DEPLOY_HOST" 'chmod 600 ~/android-signing/yuva.jks ~/android-signing/password'
+            echo "::warning::Made the Android release key on the server (~/android-signing). Back it up."
+          fi
+          echo "::add-mask::$(cat "$keys/password")"
+          echo "KEYS=$keys" >> "$GITHUB_ENV"
+      - name: Sign
+        working-directory: dist
+        run: |
+          tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$tools/zipalign" -p -f 4 release-unsigned.apk aligned.apk
+          "$tools/apksigner" sign --ks "$KEYS/yuva.jks" --ks-key-alias yuva --ks-pass "file:$KEYS/password" \
+            --key-pass "file:$KEYS/password" --out "Yuva-$VERSION.apk" aligned.apk
+          "$tools/apksigner" verify --print-certs "Yuva-$VERSION.apk" | grep -i "SHA-256" | head -n 1
+          cp release-unsigned.aab "Yuva-$VERSION.aab"
+          jarsigner -keystore "$KEYS/yuva.jks" -storepass:file "$KEYS/password" -keypass:file "$KEYS/password" \
+            -sigalg SHA256withRSA -digestalg SHA-256 "Yuva-$VERSION.aab" yuva > /dev/null
+          rm -f aligned.apk release-unsigned.apk release-unsigned.aab
+      - name: Publish
+        working-directory: dist
+        # The APK first, the feed last, so the app never offers a version it cannot download.
+        run: |
+          apk="Yuva-$VERSION.apk"
+          printf 'version: %s\ncode: %s\npath: %s\nsha256: %s\n' "$VERSION" "$CODE" "$apk" "$(sha256sum "$apk" | cut -d' ' -f1)" > latest-android.yml
+          scp $SSH_OPTS "$apk" "$DEPLOY_HOST:$DEPLOY_DIR/$apk.tmp"
+          scp $SSH_OPTS latest-android.yml "$DEPLOY_HOST:$DEPLOY_DIR/latest-android.yml.tmp"
+          ssh $SSH_OPTS "$DEPLOY_HOST" "cd $DEPLOY_DIR && mv $apk.tmp $apk && cp $apk Yuva.apk.tmp && mv Yuva.apk.tmp Yuva.apk && mv latest-android.yml.tmp latest-android.yml && ls -t Yuva-*.apk | tail -n +4 | xargs -r rm -f && chmod 644 Yuva*.apk latest-android.yml"
+          echo "Yuva for Android $VERSION ($CODE) published: https://yuva.chat/desktop/Yuva.apk" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yuva-Android-Play
+          path: dist/Yuva-*.aab
+          if-no-files-found: error
+      - name: Remove keys
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys" ~/.ssh/id_ed25519
+
+  tag:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    environment: desktop-release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ needs.build.outputs.sha }}
+          ssh-key: ${{ secrets.YUVA_TAG_KEY }}
+      - name: Tag the published version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          git tag "android-v$VERSION" "$SHA"
+          git push origin "android-v$VERSION"

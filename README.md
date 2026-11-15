@@ -7,6 +7,8 @@ a read-only deploy key.
   last `desktop-v*` / `desktop-mac-v*` tag.
 - `desktop-release.yml` — Windows installer → `https://yuva.chat/desktop/latest.yml`.
 - `desktop-mac.yml` — macOS DMG → `https://yuva.chat/desktop/latest-mac.yml`.
+- `android.yml` — Android APK (`mobile/android`) → `https://yuva.chat/desktop/Yuva.apk` and `latest-android.yml`; the
+  signed Play bundle is the run's `Yuva-Android-Play` artifact. Release key on the deploy server (top of the file).
 - `ios.yml` — iOS app (`mobile/`) → simulator launch check, then TestFlight (same Apple team, distribution certificate
   and App Store Connect API key secrets as Akış's upload; see the top of the file). Manual only: `gh workflow run ios.yml -R ataberkus/yuva-desktop-build -f ref=main`.
 
