@@ -10,6 +10,8 @@
 # password next to it, for the yuvadesk account of the `desktop-release` environment (DESKTOP_DEPLOY_KEY). The first
 # publish makes it there. Back it up: every later version must be signed with the same key, or installed apps can't
 # update. It is also the Play upload key.
+# Push: mobile/android/app/google-services.json ties the app to the Firebase project yuva-e8545 (FCM); without it the
+# build has no push.
 # The version name is mobile/package.json's, bumped past the live one when not ahead of it (as desktop-mac.yml); the
 # version code is one above the live one. poll.yml dispatches this with publish when mobile/android changes on main.
 name: Android
