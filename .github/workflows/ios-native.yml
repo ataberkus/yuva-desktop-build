@@ -87,7 +87,7 @@ jobs:
           sleep 15
           mkdir -p "$RUNNER_TEMP/shots"
           xcrun simctl io "$udid" screenshot "$RUNNER_TEMP/shots/launch.png"
-          xcrun simctl spawn "$udid" launchctl list | grep -q chat.yuva.app.preview || { echo "::error::Yuva exited during launch"; exit 1; }
+          xcrun simctl spawn "$udid" launchctl list | grep chat.yuva.app.preview > /dev/null || { echo "::error::Yuva exited during launch"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:

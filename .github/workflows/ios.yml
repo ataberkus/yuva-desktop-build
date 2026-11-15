@@ -120,7 +120,7 @@ jobs:
           sleep 30
           mkdir -p dist
           xcrun simctl io "$udid" screenshot dist/launch.png || echo "::warning::no screenshot"
-          xcrun simctl spawn "$udid" launchctl list | grep -q chat.yuva.app || { echo "::error::Yuva exited during launch"; exit 1; }
+          xcrun simctl spawn "$udid" launchctl list | grep chat.yuva.app > /dev/null || { echo "::error::Yuva exited during launch"; exit 1; }
       - name: Signing
         if: env.UPLOAD == 'true'
         env:
