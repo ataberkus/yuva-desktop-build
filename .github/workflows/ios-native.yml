@@ -1,9 +1,18 @@
 # Builds and tests the native iOS app (native/ios in ataberkus/yuva-prealpha, SwiftUI; docs/native-plan.md; private,
 # checked out with the read-only deploy key YUVA_SOURCE_KEY) on a simulator: generates the project with XcodeGen,
-# runs the unit tests, launches the app and keeps a screenshot (Actions → this run → Artifacts, public). Unsigned:
-# TestFlight uploads come later, from where the Apple secrets are.
+# runs the unit tests, launches the app and keeps a screenshot (Actions → this run → Artifacts, public).
+# With `testflight` it then signs a Release archive by hand and uploads it to App Store Connect as Yuva (chat.yuva.app,
+# 2.x; it replaced the Capacitor shell). mobile/scripts/testflight.mjs registers push on the App ID, keeps the App
+# Store profile "Yuva App Store" and picks the build number (one above App Store Connect's highest for this
+# MARKETING_VERSION). Repository secrets it needs (the Apple Developer team's, as Akış's upload uses):
+#   ASC_KEY_ID, ASC_ISSUER_ID   the App Store Connect API key's ID and issuer
+#   ASC_KEY_P8                  the key's AuthKey_<id>.p8 text
+#   APPLE_TEAM_ID               the 10-character Team ID
+#   IOS_DIST_CERT_P12           base64 of the Apple Distribution certificate + key (.p12)
+#   IOS_DIST_CERT_PASSWORD      its password
+#   gh workflow run ios-native.yml -R ataberkus/yuva-desktop-build -f ref=main -f testflight=true
 name: iOS native
-run-name: iOS native ${{ inputs.ref || github.ref_name }}
+run-name: iOS native ${{ inputs.ref || github.ref_name }}${{ inputs.testflight && ' (TestFlight)' || '' }}
 
 on:
   workflow_dispatch:
@@ -12,6 +21,10 @@ on:
         description: yuva-prealpha branch, tag or commit to build
         required: true
         default: main
+      testflight:
+        description: Sign and upload to TestFlight
+        type: boolean
+        default: false
   push:
     branches: ["claude/**"]
     paths: [".github/workflows/ios-native.yml"]
@@ -19,11 +32,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # One upload at a time: the build number is read from App Store Connect before the upload.
+  group: ios-native-${{ inputs.testflight && 'upload' || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: macos-26
     timeout-minutes: 45
     env:
+      UPLOAD: ${{ inputs.testflight && 'true' || 'false' }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       XCODEGEN_VERSION: 2.46.0
       XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
     defaults:
@@ -31,6 +54,21 @@ jobs:
         shell: bash
         working-directory: native/ios
     steps:
+      - name: Upload credentials
+        # Says which secrets are set (never their values); an upload stops here when one is missing.
+        working-directory: .
+        env:
+          IOS_DIST_CERT_P12: ${{ secrets.IOS_DIST_CERT_P12 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+        run: |
+          missing=
+          for s in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 APPLE_TEAM_ID IOS_DIST_CERT_P12 IOS_DIST_CERT_PASSWORD; do
+            if [ -n "${!s}" ]; then echo "$s: set"; else echo "$s: not set"; missing="$missing $s"; fi
+          done
+          if [ "$UPLOAD" = true ] && [ -n "$missing" ]; then
+            echo "::error::TestFlight upload needs the repository secrets:$missing (see the top of ios-native.yml)"
+            exit 1
+          fi
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ataberkus/yuva-prealpha
@@ -83,11 +121,83 @@ jobs:
           xcrun simctl bootstatus "$udid" -b
           app=$(ls -d "$RUNNER_TEMP"/dd/Build/Products/Debug-iphonesimulator/Yuva.app)
           xcrun simctl install "$udid" "$app"
-          xcrun simctl launch "$udid" chat.yuva.app.preview
+          xcrun simctl launch "$udid" chat.yuva.app
           sleep 15
           mkdir -p "$RUNNER_TEMP/shots"
           xcrun simctl io "$udid" screenshot "$RUNNER_TEMP/shots/launch.png"
-          xcrun simctl spawn "$udid" launchctl list | grep chat.yuva.app.preview > /dev/null || { echo "::error::Yuva exited during launch"; exit 1; }
+          xcrun simctl spawn "$udid" launchctl list | grep chat.yuva.app > /dev/null || { echo "::error::Yuva exited during launch"; exit 1; }
+      - name: Signing
+        if: env.UPLOAD == 'true'
+        env:
+          IOS_DIST_CERT_P12: ${{ secrets.IOS_DIST_CERT_P12 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          p12="$RUNNER_TEMP/dist.p12"
+          key="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          trap 'rm -f "$p12"' EXIT
+          printf '%s' "$IOS_DIST_CERT_P12" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -P "$IOS_DIST_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security > /dev/null
+          serial=$(openssl pkcs12 -in "$p12" -nokeys -clcerts -passin env:IOS_DIST_CERT_PASSWORD | openssl x509 -noout -serial)
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          install -m 600 /dev/null "$key"
+          printf '%s\n' "$ASC_KEY_P8" > "$key"
+          echo "ASC_KEY_PATH=$key" >> "$GITHUB_ENV"
+          version=$(sed -n 's/^ *MARKETING_VERSION: *"\{0,1\}\([0-9.]*\)"\{0,1\}$/\1/p' project.yml | head -n 1)
+          [ -n "$version" ] || { echo "::error::no MARKETING_VERSION in native/ios/project.yml"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          profile="$RUNNER_TEMP/yuva.mobileprovision"
+          (cd ../../mobile && npm ci --no-audit --no-fund > /dev/null)
+          APP_VERSION="$version" CERT_SERIAL="$serial" PROFILE_OUT="$profile" node ../../mobile/scripts/testflight.mjs > "$RUNNER_TEMP/asc.env"
+          cat "$RUNNER_TEMP/asc.env"
+          cat "$RUNNER_TEMP/asc.env" >> "$GITHUB_ENV"
+          uuid=$(sed -n 's/^PROFILE_UUID=//p' "$RUNNER_TEMP/asc.env")
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$profile" "$dir/$uuid.mobileprovision"
+          done
+      - name: Archive
+        if: env.UPLOAD == 'true'
+        run: |
+          set -o pipefail
+          xcodebuild archive -quiet -project YuvaNative.xcodeproj -scheme Yuva -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Yuva.xcarchive" \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$APPLE_TEAM_ID" PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CODE_SIGN_IDENTITY="Apple Distribution" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"
+          echo "Archived Yuva $VERSION ($BUILD_NUMBER)"
+      - name: Upload to TestFlight
+        if: env.UPLOAD == 'true'
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>chat.yuva.app</key><string>$PROFILE_NAME</string>
+            </dict>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Yuva.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          echo "Yuva iOS $VERSION ($BUILD_NUMBER) uploaded: it appears in App Store Connect → TestFlight once processed." >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -96,3 +206,9 @@ jobs:
             ${{ runner.temp }}/shots
             ${{ runner.temp }}/build.log
           if-no-files-found: warn
+      - name: Remove signing material
+        if: always()
+        working-directory: .
+        run: |
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP"/dist.p12
+          [ -z "$KEYCHAIN" ] || security delete-keychain "$KEYCHAIN" || true
