@@ -167,10 +167,24 @@ jobs:
         if: env.UPLOAD == 'true'
         run: |
           set -o pipefail
+          # The profile goes on the app target only: on the command line it would reach the Swift packages' resource
+          # bundles too (LiveKit_LiveKit), which refuse provisioning profiles.
+          python3 - "$PROFILE_NAME" <<'PY'
+          import sys
+          profile = sys.argv[1]
+          path = "project.yml"
+          text = open(path).read()
+          anchor = "          APS_ENVIRONMENT: production\n"
+          assert text.count(anchor) == 1, "no Release config for the Yuva target in project.yml"
+          text = text.replace(anchor, anchor + "          CODE_SIGN_STYLE: Manual\n"
+                              f'          PROVISIONING_PROFILE_SPECIFIER: "{profile}"\n'
+                              '          CODE_SIGN_IDENTITY: "Apple Distribution"\n')
+          open(path, "w").write(text)
+          PY
+          xcodegen generate
           xcodebuild archive -quiet -project YuvaNative.xcodeproj -scheme Yuva -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Yuva.xcarchive" \
-            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$APPLE_TEAM_ID" PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
-            CODE_SIGN_IDENTITY="Apple Distribution" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"
           echo "Archived Yuva $VERSION ($BUILD_NUMBER)"
       - name: Upload to TestFlight
