@@ -40,7 +40,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 45
+    # A Release archive of the native app alone runs past 30 minutes on these runners.
+    timeout-minutes: 120
     env:
       UPLOAD: ${{ inputs.testflight && 'true' || 'false' }}
       ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
