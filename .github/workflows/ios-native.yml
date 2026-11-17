@@ -40,7 +40,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-26
-    # A Release archive of the native app alone runs past 30 minutes on these runners.
+    # The Release archive compiles the whole app in one optimizer pass that needs most of the runner's 7 GB.
     timeout-minutes: 120
     env:
       UPLOAD: ${{ inputs.testflight && 'true' || 'false' }}
@@ -169,6 +169,9 @@ jobs:
         if: env.UPLOAD == 'true'
         run: |
           set -o pipefail
+          # The simulator the tests and the launch booted holds gigabytes the optimizer needs: left running, the
+          # archive swaps and takes several times as long.
+          xcrun simctl shutdown all
           # The profile goes on the app target only: on the command line it would reach the Swift packages' resource
           # bundles too (LiveKit_LiveKit), which refuse provisioning profiles.
           python3 - "$PROFILE_NAME" <<'PY'
@@ -228,98 +231,3 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP"/dist.p12
           [ -z "$KEYCHAIN" ] || security delete-keychain "$KEYCHAIN" || true
-
-  # TEMPORARY (Release compile timing): the test-and-launch steps of `build`, then an unsigned Release build timed,
-  # once with the simulator left booted (as the archive ran) and once with it shut down first. Prints only
-  # file:line and milliseconds, compiler phase names and memory counters, never source or the raw log (not uploaded).
-  timing:
-    runs-on: macos-26
-    timeout-minutes: 110
-    strategy:
-      fail-fast: false
-      matrix:
-        simulator: [booted, shutdown]
-    env:
-      XCODEGEN_VERSION: 2.46.0
-      XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
-    defaults:
-      run:
-        shell: bash
-        working-directory: native/ios
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ataberkus/yuva-prealpha
-          ref: ${{ inputs.ref || github.ref_name }}
-          ssh-key: ${{ secrets.YUVA_SOURCE_KEY }}
-          persist-credentials: false
-      - name: Install XcodeGen
-        working-directory: .
-        run: |
-          git -C . log -1 --format='%h'
-          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip"
-          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 -c -
-          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/xcodegen"
-          echo "$RUNNER_TEMP/xcodegen/xcodegen/bin" >> "$GITHUB_PATH"
-      - name: Test and launch on the simulator, as build does
-        run: |
-          set +e
-          xcodegen generate > /dev/null
-          udid="$(xcrun simctl list devices available -j | jq -r '
-            [.devices | to_entries[] | select(.key | startswith("com.apple.CoreSimulator.SimRuntime.iOS-"))
-             | .key as $runtime | .value[] | select(.name | startswith("iPhone"))
-             | {udid, version: ($runtime | ltrimstr("com.apple.CoreSimulator.SimRuntime.iOS-") | split("-") | map(tonumber))}]
-            | sort_by(.version) | reverse | first | .udid // empty')"
-          start=$(date +%s)
-          xcodebuild test -project YuvaNative.xcodeproj -scheme Yuva -destination "platform=iOS Simulator,id=$udid" \
-            -derivedDataPath "$RUNNER_TEMP/dbg" CODE_SIGNING_ALLOWED=NO > /dev/null 2>&1
-          code=$?
-          echo "Debug build and test: $(( $(date +%s) - start ))s, exit $code"
-          xcrun simctl boot "$udid" 2> /dev/null
-          xcrun simctl bootstatus "$udid" -b > /dev/null
-          xcrun simctl install "$udid" "$RUNNER_TEMP"/dbg/Build/Products/Debug-iphonesimulator/Yuva.app
-          xcrun simctl launch "$udid" chat.yuva.app > /dev/null
-          sleep 15
-          if [ "${{ matrix.simulator }}" = shutdown ]; then xcrun simctl shutdown all; fi
-          echo "Booted simulators: $(xcrun simctl list devices booted | grep -c Booted)"
-      - name: Release build (simulator ${{ matrix.simulator }})
-        run: |
-          set +e +o pipefail
-          xcodebuild -resolvePackageDependencies -project YuvaNative.xcodeproj -scheme Yuva > /dev/null 2>&1
-          echo "RAM: $(( $(sysctl -n hw.memsize) / 1073741824 )) GB, CPUs: $(sysctl -n hw.ncpu)"
-          swapouts() { vm_stat | awk '/Swapouts/ { gsub(/\./, "", $2); print $2 }'; }
-          before=$(swapouts)
-          ( while sleep 20; do sysctl -n vm.swapusage | awk '{ print $6 }'; done ) > "$RUNNER_TEMP/swap.txt" &
-          sampler=$!
-          stats="$RUNNER_TEMP/stats"; mkdir -p "$stats"
-          log="$RUNNER_TEMP/release.log"
-          start=$(date +%s)
-          xcodebuild build -project YuvaNative.xcodeproj -scheme Yuva -configuration Release \
-            -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/dd" -showBuildTimingSummary \
-            CODE_SIGNING_ALLOWED=NO \
-            OTHER_SWIFT_FLAGS="\$(inherited) -Xfrontend -debug-time-function-bodies -Xfrontend -warn-long-expression-type-checking=300 -Xfrontend -stats-output-dir -Xfrontend $stats" \
-            > "$log" 2>&1
-          code=$?
-          kill $sampler
-          echo "Release build (simulator ${{ matrix.simulator }}): $(( $(date +%s) - start ))s, exit $code"
-          echo "Swap-outs during the build: $(( $(swapouts) - before )) pages; peak swap used: $(sort -n "$RUNNER_TEMP/swap.txt" | tail -n 1)"
-          echo "== Build timing summary (task kinds)"
-          sed -n '/Build Timing Summary/,$p' "$log" | grep -E '^[A-Za-z][A-Za-z ]+ \([0-9]+ tasks?\) \| [0-9.]+ seconds' | sort -t'|' -k2 -rn | head -n 8
-          echo "== Slowest function bodies (type check): ms file:line"
-          grep -E $'^[0-9.]+ms\t[^\t]+\.swift:[0-9]+:[0-9]+' "$log" \
-            | awk -F'\t' '{ ms=$1; sub(/ms$/, "", ms); n=split($2, p, "/"); split(p[n], q, ":"); print ms, q[1] ":" q[2] }' \
-            | sort -rn | uniq > "$RUNNER_TEMP/bodies.txt"
-          head -n 15 "$RUNNER_TEMP/bodies.txt"
-          echo "== Slowest expressions (type check): ms file:line"
-          grep -oE '[^/ ]+\.swift:[0-9]+:[0-9]+: warning: expression took [0-9]+ms' "$log" \
-            | sed -E 's/^([^:]+):([0-9]+):[0-9]+: warning: expression took ([0-9]+)ms/\3 \1:\2/' | sort -rn | uniq > "$RUNNER_TEMP/exprs.txt"
-          head -n 10 "$RUNNER_TEMP/exprs.txt"
-          echo "== Slowest compiler phases: seconds module phase"
-          for f in "$stats"/*.json; do
-            [ -e "$f" ] || continue
-            job=$(basename "$f" .json | sed -E 's/^stats-[0-9]+-swift-frontend-//; s/-arm64.*$//')
-            jq -r --arg job "$job" 'to_entries[] | select(.key | test("^time\\.swift\\..*\\.wall$")) | "\(.value) \($job) \(.key)"' "$f"
-          done | sort -rn | awk '{ printf "%.1f %s %s\n", $1, $2, $3 }' > "$RUNNER_TEMP/phases.txt"
-          head -n 10 "$RUNNER_TEMP/phases.txt"
-          grep -E '^(\*\* BUILD|error:)' "$log" | sed -E 's/^(error:).*/\1 (see the job locally)/' | head -n 5
-          exit $code
