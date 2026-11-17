@@ -70,7 +70,7 @@ jobs:
             echo "::error::TestFlight upload needs the repository secrets:$missing (see the top of ios-native.yml)"
             exit 1
           fi
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ataberkus/yuva-prealpha
           ref: ${{ inputs.ref || github.ref_name }}
@@ -78,7 +78,8 @@ jobs:
           persist-credentials: false
       - name: Source
         run: |
-          git log -1 --format='%h %s'
+          # The hash only: this log is public, so no commit message.
+          git log -1 --format='%h'
           xcodebuild -version
       - name: Install XcodeGen
         working-directory: .
@@ -213,7 +214,7 @@ jobs:
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
             -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
           echo "Yuva iOS $VERSION ($BUILD_NUMBER) uploaded: it appears in App Store Connect → TestFlight once processed." >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: Yuva-iOS-native
@@ -227,3 +228,67 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP"/dist.p12
           [ -z "$KEYCHAIN" ] || security delete-keychain "$KEYCHAIN" || true
+
+  # TEMPORARY (Release compile timing): an unsigned Release build in each compilation mode, timed. Prints only
+  # file:line and milliseconds or compiler phase names, never source, signatures or the raw log (not uploaded).
+  timing:
+    runs-on: macos-26
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [wholemodule, singlefile]
+    env:
+      XCODEGEN_VERSION: 2.46.0
+      XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+    defaults:
+      run:
+        shell: bash
+        working-directory: native/ios
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ataberkus/yuva-prealpha
+          ref: ${{ inputs.ref || github.ref_name }}
+          ssh-key: ${{ secrets.YUVA_SOURCE_KEY }}
+          persist-credentials: false
+      - name: Install XcodeGen
+        working-directory: .
+        run: |
+          git -C . log -1 --format='%h'
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip"
+          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/xcodegen"
+          echo "$RUNNER_TEMP/xcodegen/xcodegen/bin" >> "$GITHUB_PATH"
+      - name: Release build (${{ matrix.mode }})
+        run: |
+          set +e +o pipefail
+          xcodegen generate > /dev/null
+          xcodebuild -resolvePackageDependencies -project YuvaNative.xcodeproj -scheme Yuva > /dev/null 2>&1
+          stats="$RUNNER_TEMP/stats"; mkdir -p "$stats"
+          log="$RUNNER_TEMP/release.log"
+          start=$(date +%s)
+          xcodebuild build -project YuvaNative.xcodeproj -scheme Yuva -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/dd" -showBuildTimingSummary \
+            CODE_SIGNING_ALLOWED=NO SWIFT_COMPILATION_MODE=${{ matrix.mode }} \
+            OTHER_SWIFT_FLAGS="\$(inherited) -Xfrontend -debug-time-function-bodies -Xfrontend -warn-long-expression-type-checking=300 -Xfrontend -stats-output-dir -Xfrontend $stats" \
+            > "$log" 2>&1
+          code=$?
+          echo "Release build (${{ matrix.mode }}): $(( $(date +%s) - start ))s, exit $code"
+          echo "== Build timing summary (task kinds)"
+          sed -n '/Build Timing Summary/,$p' "$log" | grep -E '^[A-Za-z][A-Za-z ]+ \([0-9]+ tasks?\) \| [0-9.]+ seconds' | sort -t'|' -k2 -rn | head -n 12
+          echo "== Slowest function bodies (type check): ms file:line"
+          grep -E $'^[0-9.]+ms\t[^\t]+\.swift:[0-9]+:[0-9]+' "$log" \
+            | awk -F'\t' '{ ms=$1; sub(/ms$/, "", ms); n=split($2, p, "/"); split(p[n], q, ":"); print ms, q[1] ":" q[2] }' \
+            | sort -rn | uniq | head -n 30
+          echo "== Slowest expressions (type check): ms file:line"
+          grep -oE '[^/ ]+\.swift:[0-9]+:[0-9]+: warning: expression took [0-9]+ms' "$log" \
+            | sed -E 's/^([^:]+):([0-9]+):[0-9]+: warning: expression took ([0-9]+)ms/\3 \1:\2/' | sort -rn | uniq | head -n 30
+          echo "== Slowest compiler jobs and phases: seconds module/file phase"
+          for f in "$stats"/*.json; do
+            [ -e "$f" ] || continue
+            job=$(basename "$f" .json | sed -E 's/^stats-[0-9]+-swift-frontend-//; s/-arm64.*$//')
+            jq -r --arg job "$job" 'to_entries[] | select(.key | test("^time\\.swift\\..*\\.wall$")) | "\(.value) \($job) \(.key)"' "$f"
+          done | sort -rn | awk '{ printf "%.1f %s %s\n", $1, $2, $3 }' | head -n 40
+          grep -E '^(\*\* BUILD|error:)' "$log" | sed -E 's/^(error:).*/\1 (see the job locally)/' | head -n 5
+          exit $code
