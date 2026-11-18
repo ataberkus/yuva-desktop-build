@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: xcode-27
     # The Release archive compiles the whole app in one optimizer pass that needs most of the runner's 7 GB.
     timeout-minutes: 120
     env:
