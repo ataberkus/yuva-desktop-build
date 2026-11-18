@@ -97,8 +97,8 @@ jobs:
             udid="$(xcrun simctl list devices available -j | jq -r '
               [.devices | to_entries[] | select(.key | startswith("com.apple.CoreSimulator.SimRuntime.iOS-"))
                | .key as $runtime | .value[] | select(.name | startswith("iPhone"))
-               | {udid, version: ($runtime | ltrimstr("com.apple.CoreSimulator.SimRuntime.iOS-") | split("-") | map(tonumber))}]
-              | sort_by(.version) | reverse | first | .udid // empty')"
+               | {udid, standard: ($runtime | test("^com\\.apple\\.CoreSimulator\\.SimRuntime\\.iOS-[0-9]+(-[0-9]+)*$")), version: ($runtime | ltrimstr("com.apple.CoreSimulator.SimRuntime.iOS-") | split("-") | map(tonumber? // empty))}]
+              | sort_by([.standard, .version]) | reverse | first | .udid // empty')"
             [ -n "$udid" ] && break
             echo "No iPhone simulator yet (attempt $attempt)"
             sleep 10
