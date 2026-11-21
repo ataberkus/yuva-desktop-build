@@ -1,7 +1,7 @@
 # Stands in for the source repo's push trigger (its own Actions are off): every 10 minutes, compares
-# ataberkus/yuva-prealpha main with the commit of the newest desktop-v* / desktop-mac-v* / android-v* tag and dispatches the
-# matching build with publish when its paths changed. A commit that already has a run of that workflow (whatever
-# its result) is not dispatched again: rerun a failed one from the Actions tab, or push a fix.
+# ataberkus/yuva-prealpha main with the commit of the newest desktop-v* / desktop-mac-v* / android-v* / ios-v* tag and
+# dispatches the matching build with publish (testflight for iOS) when its paths changed. A commit that already has a run
+# of that workflow (whatever its result) is not dispatched again: rerun a failed one from the Actions tab, or push a fix.
 # Scheduled workflows stop after 60 days without a commit to this repo; GitHub mails a warning first.
 name: Poll source
 
@@ -36,9 +36,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           head=$(git rev-parse HEAD)
-          # dispatch <workflow> <tag prefix> <pathspec>...
+          # dispatch <workflow> <tag prefix> <pathspec>...; PUBLISH names the workflow's publish input (default publish).
           dispatch() {
-            local wf=$1 prefix=$2; shift 2
+            local wf=$1 prefix=$2 input=${PUBLISH:-publish}; shift 2
             local last
             last=$(git tag -l "$prefix*" --sort=-v:refname | head -n 1)
             if [ -n "$last" ] && git diff --quiet --no-renames "$last" "$head" -- "$@"; then
@@ -50,7 +50,7 @@ jobs:
               return
             fi
             echo "$wf: dispatching $head (last release ${last:-none})"
-            gh workflow run "$wf" -R "$GITHUB_REPOSITORY" -f ref="$head" -f publish=true
+            gh workflow run "$wf" -R "$GITHUB_REPOSITORY" -f ref="$head" -f "$input=true"
           }
           dispatch desktop-release.yml desktop-v \
             desktop-rs ':(exclude,glob)desktop-rs/**/*.md'
@@ -64,3 +64,6 @@ jobs:
           dispatch android.yml android-v \
             mobile/android mobile/www mobile/capacitor.config.json mobile/package.json mobile/package-lock.json \
             ':(exclude,glob)mobile/**/*.md'
+          # The native iOS app, to TestFlight.
+          PUBLISH=testflight dispatch ios-native.yml ios-v \
+            native/ios ':(exclude,glob)native/ios/**/*.md'
